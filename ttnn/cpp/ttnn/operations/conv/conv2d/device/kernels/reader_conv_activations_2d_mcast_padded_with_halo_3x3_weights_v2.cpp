@@ -345,4 +345,7 @@ void kernel_main() {
     }
 
     noc.async_write_barrier();
+    if (is_receiver_core && act_w_num_outer > 1) {
+        noc.async_atomic_barrier();
+    }
 }
