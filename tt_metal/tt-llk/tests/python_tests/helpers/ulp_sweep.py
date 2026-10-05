@@ -451,28 +451,6 @@ def _known_lanes() -> Dict:
         high=65504.0,
         why="inf where the answer is x itself, in the top four fp16 values, on a 16-bit Dest",
     )
-
-    def store_saturates(float16_b, bfp8_b, **fields):
-        """#57215: the Float16 store saturates a value just past 65504 to 65504 rather
-        than to an infinity, on a 32-bit Dest packed to Float16, where the golden's fp16
-        rounding answers inf. One entry per input, because the inputs reaching that band
-        differ: a Float16_b input reaches the kernel as it is, so only the one value
-        whose answer is 2**16 lands there; a Bfp8_b input is block-quantized first, so
-        its window is every bf16 value the quantizer maps onto that one -- the
-        quantization preimage, not a wider defect."""
-        shared = dict(
-            issue="#57215", output=DataFormat.Float16, dest=DestAccumulation.Yes
-        )
-        return tuple(
-            KnownNonfiniteLanes(
-                **shared, inputs=(fmt,), low=bounds[0], high=bounds[1], **fields
-            )
-            for fmt, bounds in (
-                (DataFormat.Float16_b, float16_b),
-                (DataFormat.Bfp8_b, bfp8_b),
-            )
-        )
-
     _KNOWN_NONFINITE_LANES.update(
         {
             MathOperation.Celu: (KnownNonfiniteLanes(**top_of_fp16),),
