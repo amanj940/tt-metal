@@ -6065,9 +6065,14 @@ def _generate_chunked_configs(model_configs):
 
 
 CHUNKED_CONFIGS, CHUNKED_CONFIG_IDS = _generate_chunked_configs(CHUNKED_PREFILL_MODEL_CONFIGS)
-# The generic table remains unchanged. Gemma has a dedicated table below because its chunk size,
-# K splitting, segmented accumulation, matmul fidelity, and packed-K/V layout are coupled.
 CHUNKED_PERF_CONFIGS, CHUNKED_PERF_CONFIG_IDS = _generate_chunked_configs(CHUNKED_PREFILL_MODEL_CONFIGS)
+CHUNKED_PERF_TABLE_CONFIGS = [
+    (model_name, q_chunk_size, k_chunk_size, None) for model_name, q_chunk_size, k_chunk_size in CHUNKED_PERF_CONFIGS
+] + [
+    (config.model_name, config.q_chunk_size, config.k_chunk_size, config)
+    for config in GEMMA4_CHUNKED_PERF_TABLE_CONFIGS
+]
+CHUNKED_PERF_TABLE_CONFIG_IDS = CHUNKED_PERF_CONFIG_IDS + GEMMA4_CHUNKED_PERF_TABLE_CONFIG_IDS
 RING_MLA_CHUNKED_CONFIGS, RING_MLA_CHUNKED_CONFIG_IDS = _generate_chunked_configs(RING_MLA_CHUNKED_MODEL_CONFIGS)
 MINIMAX3_GQA_CHUNKED_CONFIGS, MINIMAX3_GQA_CHUNKED_CONFIG_IDS = _generate_chunked_configs(
     MINIMAX3_GQA_CHUNKED_MODEL_CONFIGS
@@ -7467,16 +7472,28 @@ def _run_chunked_perf_table(
 @pytest.mark.skipif(os.environ.get("CI") == "true", reason="Performance test - skip on CI")
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
-    "model_name,q_chunk_size,k_chunk_size",
-    CHUNKED_PERF_CONFIGS,
-    ids=CHUNKED_PERF_CONFIG_IDS,
+    "model_name,q_chunk_size,k_chunk_size,perf_config",
+    CHUNKED_PERF_TABLE_CONFIGS,
+    ids=CHUNKED_PERF_TABLE_CONFIG_IDS,
 )
-def test_ring_joint_attention_create_chunked_perf_table(model_name, q_chunk_size, k_chunk_size):
-    """Per-chunk math-util + duration table for the classic separate-K/V chunked-prefill path,
-    profiling the reuse_kv variant (one oversized cache reused across chunks). Per-chunk device time
-    tracks the logical_n-bounded gather, exposing whether the gather honours that bound."""
-    model = CHUNKED_PERF_MODEL_CONFIGS[model_name]
-    chunk_size, _ = get_chunked_perf_workload(model, MESH_CONFIG)
+def test_ring_joint_attention_create_chunked_perf_table(model_name, q_chunk_size, k_chunk_size, perf_config):
+    """Per-chunk performance table for generic and Gemma chunked prefill configurations."""
+    if perf_config is None:
+        model = CHUNKED_PERF_MODEL_CONFIGS[model_name]
+        chunk_size, _ = get_chunked_perf_workload(model, MESH_CONFIG)
+        accuracy_test_name = "test_ring_joint_attention_chunked_perf_impl"
+        subdir = "ttnn_ring_joint_sdpa_chunked_performance"
+        label = "Ring Joint Chunked-Prefill (reuse KV buffer)"
+    else:
+        model = replace(
+            GEMMA4_CHUNKED_PERF_MODEL_CONFIGS[model_name],
+            seq_len=perf_config.chunk_size // MESH_CONFIG.sp_size,
+        )
+        chunk_size = perf_config.chunk_size
+        accuracy_test_name = "test_ring_joint_attention_gemma4_chunked_perf_impl"
+        subdir = "ttnn_ring_joint_sdpa_gemma4_chunked_performance"
+        label = "Gemma 4 Ring SDPA Chunked-Prefill (reuse KV buffer)"
+
     _run_chunked_perf_table(
         MESH_CONFIG,
         model,
@@ -7484,36 +7501,9 @@ def test_ring_joint_attention_create_chunked_perf_table(model_name, q_chunk_size
         q_chunk_size,
         k_chunk_size,
         chunk_size,
-        accuracy_test_name="test_ring_joint_attention_chunked_perf_impl",
-        subdir="ttnn_ring_joint_sdpa_chunked_performance",
-        label="Ring Joint Chunked-Prefill (reuse KV buffer)",
-        id_suffix="-reuse_kv",
-    )
-
-
-@pytest.mark.skipif(os.environ.get("CI") == "true", reason="Performance test - skip on CI")
-@pytest.mark.timeout(1200)
-@pytest.mark.parametrize(
-    "perf_config",
-    GEMMA4_CHUNKED_PERF_TABLE_CONFIGS,
-    ids=GEMMA4_CHUNKED_PERF_TABLE_CONFIG_IDS,
-)
-def test_ring_joint_attention_gemma4_create_chunked_perf_table(perf_config):
-    """Gemma perf table with q/k, K-split, and segmented-accumulation search dimensions."""
-    model = replace(
-        GEMMA4_CHUNKED_PERF_MODEL_CONFIGS[perf_config.model_name],
-        seq_len=perf_config.chunk_size // MESH_CONFIG.sp_size,
-    )
-    _run_chunked_perf_table(
-        MESH_CONFIG,
-        model,
-        perf_config.model_name,
-        perf_config.q_chunk_size,
-        perf_config.k_chunk_size,
-        perf_config.chunk_size,
-        accuracy_test_name="test_ring_joint_attention_gemma4_chunked_perf_impl",
-        subdir="ttnn_ring_joint_sdpa_gemma4_chunked_performance",
-        label="Gemma 4 Ring SDPA Chunked-Prefill (reuse KV buffer)",
+        accuracy_test_name=accuracy_test_name,
+        subdir=subdir,
+        label=label,
         id_suffix="-reuse_kv",
         perf_config=perf_config,
     )
@@ -7822,14 +7812,15 @@ def test_ring_joint_attention_minimax3_gqa_rotated_q_perf():
     )
 
 
-# Three-run medians on the 8x4 BH production mesh. Global values use LoFi peak throughput.
+# Three-run medians on the 4x8 BH test mesh after restoring the original fixed SP/TP axes.
+# Global values use LoFi peak throughput.
 GEMMA4_CHUNKED_EXPECTED_UTILIZATION = {
-    ("gemma4_global", 2048): 34.0,
-    ("gemma4_global", 4096): 50.6,
-    ("gemma4_global", 8192): 44.8,
-    ("gemma4_swa", 2048): 2.54,
-    ("gemma4_swa", 4096): 4.96,
-    ("gemma4_swa", 8192): 6.96,
+    ("gemma4_global", 2048): 33.48,
+    ("gemma4_global", 4096): 50.31,
+    ("gemma4_global", 8192): 44.81,
+    ("gemma4_swa", 2048): 2.49,
+    ("gemma4_swa", 4096): 4.47,
+    ("gemma4_swa", 8192): 6.74,
 }
 GEMMA4_CHUNKED_PERF_CHECK_CONFIGS = [
     (config, GEMMA4_CHUNKED_EXPECTED_UTILIZATION[(config.model_name, config.chunk_size)], 0.25)
