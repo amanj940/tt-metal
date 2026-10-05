@@ -725,7 +725,8 @@ class TestConfig:
         ``"cfg.h"``, ``"sfpu/..."`` — the same four roots ``setup_compilation_options``
         already adds for the in-tree copy.
 
-        For a ``tt_llk_quasar`` tree, prepend the selected variant's header root.
+        For a ``tt_llk_quasar`` tree, prepend the selected variant's header root
+        and expose the tree root for qualified includes of the base headers.
         """
         root = Path(arch_root)
         roots = [
@@ -735,6 +736,7 @@ class TestConfig:
             root / "common" / "inc" / "sfpu",
         ]
         if root.name == "tt_llk_quasar":
+            roots.append(root)
             variant = quasar_arch_variant()
             if variant:
                 # First, so the variant's headers shadow the base Quasar ones.
