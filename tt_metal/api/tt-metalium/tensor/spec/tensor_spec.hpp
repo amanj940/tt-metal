@@ -54,14 +54,20 @@ public:
     /// Performs 2D height sharding for TensorSpec.
     /// This flattens the tensor into a 2D shape and splits it along the height to achieve as close to equal
     /// distribution as possible, while maintaining just 1 shard per core.
+    /// If the grid has more cores than there are shards, the resulting grid is just the cores that receive a
+    /// shard: the first N cores in orientation order.
     TensorSpec height_sharded(CoreRangeSet grid, ShardOrientation orientation = ShardOrientation::ROW_MAJOR) const;
     /// Performs 2D width sharding for TensorSpec.
     /// This flattens the tensor into a 2D shape and splits it along the width to achieve as close to equal distribution
     /// as possible, while maintaining just 1 shard per core.
+    /// If the grid has more cores than there are shards, the resulting grid is just the cores that receive a
+    /// shard: the first N cores in orientation order.
     TensorSpec width_sharded(CoreRangeSet grid, ShardOrientation orientation = ShardOrientation::ROW_MAJOR) const;
     /// Performs 2D block sharding for TensorSpec.
     /// This flattens the tensor into a 2D shape and splits it into 2D contiguous blocks, putting each block onto the
     /// corresponding core in 2D grid.
+    /// If the grid has more cores than there are shards, the resulting grid is just the cores that receive a
+    /// shard: the leading rows x cols block.
     TensorSpec block_sharded(CoreRange grid, ShardOrientation orientation = ShardOrientation::ROW_MAJOR) const;
 
     enum class ShardShapeAlignment {
