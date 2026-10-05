@@ -88,8 +88,12 @@ void run_kernel(RUNTIME_PARAMETERS params)
 
     set_up_fpu_to_pack_dest_dvalid_chain<dest_dvalid_client::FPU>();
 
-    DataFormat math_format     = static_cast<DataFormat>(formats.math);
-    DataFormat pack_src_format = static_cast<DataFormat>(formats.pack_src);
+    // formats.math holds a 2x-packed register format's non-2x family member, since the 2x formats exist only in the
+    // Src registers; the ALU is configured with the register format itself, the one the unpacker implies
+    const DataFormat unpack_dst_format = static_cast<DataFormat>(formats.unpack_A_dst);
+    const bool is_2x_format            = (unpack_dst_format == DataFormat::MxFp4_2x_A) || (unpack_dst_format == DataFormat::MxFp4_2x_B);
+    DataFormat math_format             = is_2x_format ? unpack_dst_format : static_cast<DataFormat>(formats.math);
+    DataFormat pack_src_format         = static_cast<DataFormat>(formats.pack_src);
     if constexpr (is_fp32_dest_acc_en)
     {
         if (pack_src_format == DataFormat::Int32)
