@@ -49,21 +49,18 @@ inline void _llk_math_srcAB_hw_configure_(DataFormat srcA_format, DataFormat src
         alu_config.val[i] = 0;
     }
 
-    if constexpr (!EN_IMPLIED_MATH_FORMAT)
-    {
-        // Set ALU SrcA format since it is not implied
-        // If input format has exp_width == 5, the math dest set to Float16
-        // else input format has exp_width == 8, the math dest set to Float16_b
-        alu_config.f.ALU_FORMAT_SPEC_REG_SrcA_val      = SRCA_FORMAT_MASKED;
-        alu_config.f.ALU_FORMAT_SPEC_REG_SrcA_override = 0x1;
-        alu_config.f.ALU_FORMAT_SPEC_REG_SrcB_val      = SRCB_FORMAT_MASKED;
-        alu_config.f.ALU_FORMAT_SPEC_REG_SrcB_override = 0x1;
+    // Set the ALU SrcA/SrcB formats even when they are implied: the FPU then takes the unpacker's formats instead,
+    // but the formats here still describe Dest -- an input with exp_width == 5 makes the math dest Float16, and one
+    // with exp_width == 8 Float16_b -- so they agree with the formats in _configure_alu_formats_.
+    alu_config.f.ALU_FORMAT_SPEC_REG_SrcA_val      = SRCA_FORMAT_MASKED;
+    alu_config.f.ALU_FORMAT_SPEC_REG_SrcA_override = !EN_IMPLIED_MATH_FORMAT;
+    alu_config.f.ALU_FORMAT_SPEC_REG_SrcB_val      = SRCB_FORMAT_MASKED;
+    alu_config.f.ALU_FORMAT_SPEC_REG_SrcB_override = !EN_IMPLIED_MATH_FORMAT;
 
-        // RT: Since SrcA & SrcB need to match exponent widths, can set them the same for now
-        // Check with HW team if different mixes between Src registers are allowed
-        alu_config.f.ALU_FORMAT_SPEC_REG0_SrcA = SRCA_FORMAT_MASKED;
-        alu_config.f.ALU_FORMAT_SPEC_REG1_SrcB = SRCB_FORMAT_MASKED;
-    }
+    // RT: Since SrcA & SrcB need to match exponent widths, can set them the same for now
+    // Check with HW team if different mixes between Src registers are allowed
+    alu_config.f.ALU_FORMAT_SPEC_REG0_SrcA = SRCA_FORMAT_MASKED;
+    alu_config.f.ALU_FORMAT_SPEC_REG1_SrcB = SRCB_FORMAT_MASKED;
 
     alu_config.f.ALU_ACC_CTRL_Fp32_enabled      = EN_FP32_MATH_FORMAT;
     alu_config.f.ALU_ACC_CTRL_SFPU_Fp32_enabled = EN_FP32_MATH_FORMAT;
