@@ -3308,6 +3308,13 @@ class UnarySFPUGolden:
         return sfpu_min(x, self._UNARY_MAX_MIN_VALUE)
 
     def _polygamma(self, x):
+        # torch.polygamma(1, x) returns a finite value at the non-positive integers
+        # (4.3e15 at -6.0), where trigamma has a pole. The limit is what the golden
+        # should say: +inf for an odd order, which both sides agree on, NaN for an even
+        # one, which they do not. The sweep claims nothing on those lanes either way.
+        value = float(x)
+        if math.isfinite(value) and value <= 0 and value == math.floor(value):
+            return math.inf if self._POLYGAMMA_ORDER % 2 == 1 else math.nan
         return self._torch_unary(x, lambda t: torch.polygamma(self._POLYGAMMA_ORDER, t))
 
     def _xielu(self, x):

@@ -892,28 +892,27 @@ def test_enrolled_ops_is_sorted_and_stable():
 
 
 #: Enrolled ops with no step budget anywhere: the 3-segment LUT pair, two binaries
-#: whose per-format tolerances moved into the table, five transcendentals whose *best*
-#: cell is already past its output's usable ceiling (6 bf16, 51 fp16, 25 Bfp8_b) -- the
-#: measurements are on their rows, not repeated here to drift -- and Expm1Cw, which
-#: returns -1 where expm1 overflows (x past ~88.7) on every cell, so no cell has a lane
-#: count a step budget can describe. Recorded, not fixed; tracked: Erfc #51137, Digamma
-#: #51128, Softplus #51866 (input clamps, under #52178) and Lgamma #55356.
+#: whose per-format tolerances moved into the table, and three transcendentals whose
+#: *best* cell is still past its output's usable ceiling (6 bf16, 51 fp16, 25 Bfp8_b)
+#: once the near-zero floor the emitter grants (up to 1e-3) is applied -- the
+#: measurements are on their rows, not repeated here to drift. Softplus answers 0 below
+#: x = -5, a 0.0065 cut-off a 1e-3 floor cannot cover; Digamma and Lgamma are wrong for
+#: negative and small positive x. Recorded, not fixed; tracked: Digamma #51128, Softplus
+#: #51866 (input clamps, under #52178) and Lgamma #55356.
 #:
-#: Sign, Heaviside, GeluTanh, Tanhshrink, Xielu, I1 and SfpuElwmul are not here: per
-#: variant, some of their cells are inside the ceiling, and the rest fall through to
-#: tolerance.
+#: Erfc, Polygamma and Expm1Cw left this set with the claim applied to the ranking, the
+#: Dest-capacity rule and the emitted floor: each has cells inside the ceiling now and
+#: the rest fall through to tolerance, like Sign, Heaviside, GeluTanh, Tanhshrink,
+#: Xielu, I1 and SfpuElwmul.
 ONLY_EVER_TOLERANCE = frozenset(
     {
         MathOperation.SigmoidAppx,
         MathOperation.GeluAppx,
         MathOperation.SfpuElwpow,
         MathOperation.SfpuXlogy,
-        MathOperation.Erfc,
-        MathOperation.Polygamma,
         MathOperation.Softplus,
         MathOperation.Lgamma,
         MathOperation.Digamma,
-        MathOperation.Expm1Cw,
     }
 )
 
@@ -1708,20 +1707,10 @@ def test_an_emitted_row_is_held_to_the_run_on_its_key_line(tmp_path):
 #: on, each with that cause. A cell whose disagreeing lanes are a tracked defect on a
 #: handful of inputs does not belong here: name the inputs in
 #: ``ulp_sweep._KNOWN_NONFINITE_LANES`` instead, and the rest of the cell stays gated.
-_NO_INFINITY_IN_A_16BIT_DEST = (
-    "the golden models a 16-bit Dest as IEEE fp16, whose range ends at 65504, while the "
-    "hardware's 16-bit Dest carries a magnitude up to ~131008 and no infinity: where the "
-    "answer is past 65504 the kernel reads a finite value (-66560 for tan(177.5), -130560 "
-    "for sinh(-65504)) against the golden's -inf"
-)
 _UNMEASURABLE_CELLS_ACKNOWLEDGED = {
-    # -- the store or the Dest, not the op ------------------------------------------
-    **{
-        (op, DataFormat.Float16, None, None, DestAccumulation.No): (
-            _NO_INFINITY_IN_A_16BIT_DEST
-        )
-        for op in (MathOperation.Sinh, MathOperation.Tan)
-    },
+    # An answer a 16-bit Dest cannot hold under a wider output is no longer a cell's
+    # verdict (`ulp_sweep.dest_holds`), which retired the Sinh/Tan Float16 dest_acc=No
+    # acknowledgements and Exp's at fp32's overflow edge through an fp16 Dest.
     # -- the approximation's own shortfall at the fp16 overflow edge ----------------
     (
         MathOperation.Exp,
@@ -1741,16 +1730,6 @@ _UNMEASURABLE_CELLS_ACKNOWLEDGED = {
         ApproximationMode.Yes,
         None,
     ): ("the same shortfall from a strided Float32 input, one lane"),
-    (
-        MathOperation.Exp,
-        DataFormat.Float16,
-        DataFormat.Float32,
-        ApproximationMode.Yes,
-        DestAccumulation.Yes,
-    ): (
-        "the same shortfall at fp32's overflow edge: exp(88.75) is 3.497e38, past "
-        "FLT_MAX, and the approximation answers 3.396e38, one lane"
-    ),
     # -- kernel behaviour over a wide band of the format, not yet triaged -----------
     # Each is what the sweep found and the row records; none is a golden or store
     # artefact, and none is a handful of lanes an issue could name. They hold their
@@ -1794,8 +1773,6 @@ _UNMEASURABLE_CELLS_ACKNOWLEDGED = {
 #: makes a newly demoted cell a change someone has to read: the table moved, the cause
 #: must be looked at, and the number here bumped on purpose. Exact-cell keys need no pin.
 _UNMEASURABLE_CELLS_ACKNOWLEDGED_COUNTS = {
-    (MathOperation.Sinh, DataFormat.Float16, None, None, DestAccumulation.No): 2,
-    (MathOperation.Tan, DataFormat.Float16, None, None, DestAccumulation.No): 2,
     (
         MathOperation.Exp,
         DataFormat.Float16,
@@ -1810,14 +1787,14 @@ _UNMEASURABLE_CELLS_ACKNOWLEDGED_COUNTS = {
         ApproximationMode.Yes,
         None,
     ): 2,
-    (MathOperation.Digamma, None, None, None, None): 22,
-    (MathOperation.ExpWithBase, None, None, ApproximationMode.Yes, None): 25,
-    (MathOperation.Expm1Cw, None, None, None, None): 25,
-    (MathOperation.I0, None, None, None, None): 22,
-    (MathOperation.I1, None, None, None, None): 20,
-    (MathOperation.Lgamma, None, None, None, None): 20,
-    (MathOperation.Polygamma, None, None, None, None): 46,
-    (MathOperation.Rpow, None, None, None, None): 20,
+    (MathOperation.Digamma, None, None, None, None): 11,
+    (MathOperation.ExpWithBase, None, None, ApproximationMode.Yes, None): 16,
+    (MathOperation.Expm1Cw, None, None, None, None): 19,
+    (MathOperation.I0, None, None, None, None): 13,
+    (MathOperation.I1, None, None, None, None): 9,
+    (MathOperation.Lgamma, None, None, None, None): 8,
+    (MathOperation.Polygamma, None, None, None, None): 24,
+    (MathOperation.Rpow, None, None, None, None): 16,
 }
 
 
