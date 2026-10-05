@@ -67,7 +67,7 @@ public:
     // The chips UMD opens from the simulator build in simulator_dir. A partitioned build (one with an
     // ip_layout.yaml) states its own devices, so it gets none and UMD opens all of them, or the ones
     // TT_VISIBLE_DEVICES selects. Any other build is a single chip, 0.
-    static std::unordered_set<ChipId> simulator_target_devices(const std::filesystem::path& simulator_dir);
+    static std::unordered_set<ChipId> simulator_target_devices(const std::filesystem::path& simulator_dir, tt::ARCH arch);
     Cluster& operator=(const Cluster&) = delete;
     Cluster& operator=(Cluster&& other) noexcept = delete;
     Cluster(const Cluster&) = delete;
