@@ -17,7 +17,6 @@ the wrong row is a silently wrong gate rather than an error, so the file guards:
 
 import functools
 import math
-import re
 import textwrap
 from dataclasses import fields
 from itertools import product
@@ -60,7 +59,7 @@ from helpers.ulp import (
     has_ulp_gate,
     ulp_dtype,
 )
-from helpers.ulp_sweep import _DATED, _row_fields
+from helpers.ulp_provenance import BudgetTable, Kind
 from helpers.utils import passed_test
 
 UNSWEPT_ARCHS = [a for a in ChipArchitecture if a != MEASURED_ARCH]
@@ -1441,63 +1440,48 @@ def test_no_enrolled_op_is_driven_by_a_sweep_that_was_never_measured():
 
 # ── Every step budget records the measurement it came from ────────────────────
 #
-# The measurement lives in the YAML comment beside the row (or on the op's header line),
-# so it is read from the text: YAML discards comments. Widening a budget without
-# re-measuring then has to falsify that comment.
+# The measurement lives in the YAML comment beside the row (or on the op's key line),
+# which YAML discards; `BudgetTable` reads it as a `Provenance`. Widening a budget
+# without re-measuring then has to falsify that comment.
 
 #: How far a *sampled* row's budget may sit above its measurement. Its comment records
 #: a sample, and the hand-set headroom over the tail the sample did not see varies; an
 #: exhaustive row saw every value and carries exactly the emitter's budget instead.
 MEASUREMENT_HEADROOM = 2
 
-#: ``max 65536 ULP`` in the emitted rows, ``0 ULP`` in the hand-measured ones.
-_MEASUREMENT = re.compile(r"(?:max )?(\d+) ULP")
-
-#: What marks a row's comment as the exhaustive sweep's: ``write_table``'s suffix.
-_EXHAUSTIVE = "exhaustive"
-
-# A run label names the day it ran: ``_DATED``, imported from the emitter, which decides
-# by the same test whether a row names its own run. The emitter writes the label once
-# per op on the key line and leaves each row with its number alone, so a row speaks for
-# its own run only when it carries a date; the number says what was measured, not
-# which run measured it.
-
 
 def _measured_budget_rows(path=_TABLE_PATH):
-    """``(op_name, row_text, max_ulp, measured_or_None, exhaustive)`` for every
-    ``max_ulp`` row. *exhaustive* is whether the run that measured it is the sweep:
-    the row's own, when its comment is dated, and the op's key line otherwise.
+    """``(row, measured_or_None, exhaustive)`` for every ``max_ulp`` row. *measured* is
+    the row's own figure, or its key line's header's when the row records none.
+    *exhaustive* is whether the run that measured it is the sweep: the row's own, when
+    its comment names one, and the op's key line's otherwise.
 
     Deciding that by "the row has a number" instead read every emitted row -- which has
-    a number and no label -- as a sampled one, and the exhaustive audit below then
+    a number and no run -- as a sampled one, and the exhaustive audit below then
     covered 10 of the table's 1,614 budgets. Acosh's ``max_ulp: 7  # max 6 ULP`` raised
     to 12 with its comment untouched passed."""
-    rows, op, op_measured, op_exhaustive = [], None, None, False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line.startswith(" "):  # `OpName:`, optionally with a header comment
-            head, _, comment = line.partition("#")
-            op = head.split(":")[0].strip()
-            found = _MEASUREMENT.search(comment)
-            op_measured = int(found.group(1)) if found else None
-            op_exhaustive = _EXHAUSTIVE in comment
-            continue
-        body, _, comment = line.strip().partition("#")
-        declared = re.search(r"max_ulp:\s*(\d+)", body)
-        if not declared:
+    table = BudgetTable.load(path)
+    rows = []
+    for row in table.rows:
+        if row.max_ulp is None:
             continue  # a tolerance row has no step budget to back
-        found = _MEASUREMENT.search(comment)
-        measured = int(found.group(1)) if found else op_measured
-        exhaustive = _EXHAUSTIVE in comment if _DATED.search(comment) else op_exhaustive
-        rows.append((op, body.strip(), int(declared.group(1)), measured, exhaustive))
+        key_line = table.blocks[row.op].key_line
+        own = row.provenance
+        if own is not None and own.measured is not None:
+            measured = own.measured
+        else:
+            measured = key_line.header_provenance.measured
+        exhaustive = (
+            own.run_is_exhaustive(key_line) if own is not None else key_line.exhaustive
+        )
+        rows.append((row, measured, exhaustive))
     return rows
 
 
 def test_the_provenance_parser_sees_every_budget_the_registry_enforces():
-    """A row the regex misses (``max_ulp : 5``, ``+5``, ``0x10``) would silently escape
-    the two audits below, so tie the parse back to the loaded table."""
-    parsed = sorted((op, budget) for op, _, budget, _, _ in _measured_budget_rows())
+    """A row the walk misses would silently escape the two audits below, so tie it back
+    to the loaded table."""
+    parsed = sorted((row.op, row.max_ulp) for row, _, _ in _measured_budget_rows())
     loaded = sorted(
         (op.name, contract.max_ulp)
         for op, table in _SFPU_ACCURACY_BUDGET.items()
@@ -1509,10 +1493,10 @@ def test_the_provenance_parser_sees_every_budget_the_registry_enforces():
 
 def test_every_step_budget_names_the_measurement_it_came_from():
     rows = _measured_budget_rows()
-    assert rows, "no max_ulp rows found -- the parser has drifted from the table"
-    unbacked = [(op, body) for op, body, _, measured, _ in rows if measured is None]
+    assert rows, "no max_ulp rows found -- the walk has drifted from the table"
+    unbacked = [row.describe() for row, measured, _ in rows if measured is None]
     assert not unbacked, "budgets with no recorded measurement:\n" + "\n".join(
-        f"  {op}: {body}" for op, body in unbacked
+        f"  {row}" for row in unbacked
     )
 
 
@@ -1544,34 +1528,24 @@ def test_the_emitter_and_the_guards_agree_on_which_ops_are_exact():
 
 
 def _sampled_zero_budgets(path=_TABLE_PATH):
-    """``(op_name, row_text)`` for every ``max_ulp: 0`` row whose measurement was a
-    sample: it names its own dated run, and that run is not the exhaustive sweep. A row
-    naming no run of its own was emitted by the run on its key line."""
-    found, op, key_run = [], None, ""
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line.startswith(" "):
-            op, _, key_run = line.partition(":")[0].strip(), None, line
-            continue
-        body, _, note = line.strip().partition("#")
-        if not re.search(r"max_ulp:\s*0\b", body):
-            continue
-        run = note if _DATED.search(note) else key_run
-        if _EXHAUSTIVE not in run:
-            found.append((op, body.strip()))
-    return found
+    """Every ``max_ulp: 0`` row whose measurement was a sample: the run behind it --
+    its own, or its key line's when it names none -- is not the exhaustive sweep."""
+    return [
+        row
+        for row, _, exhaustive in _measured_budget_rows(path)
+        if row.max_ulp == 0 and not exhaustive
+    ]
 
 
-def _narrows_on_a_32_bit_dest(body) -> bool:
-    """Whether *body* pins a cell whose output holds fewer mantissa bits than its input,
+def _narrows_on_a_32_bit_dest(row) -> bool:
+    """Whether *row* pins a cell whose output holds fewer mantissa bits than its input,
     on a 32-bit Dest (``dest: "Yes"`` or unpinned): there the operand an exact op
     returns -- a selected fp32 value, an fp32 integer -- is rounded at pack, as Abs,
     Neg and Identity's 1-step Float32 -> Float16_b cells record. On a 16-bit Dest the
     unpack has narrowed it already. A row that leaves `in` or `out` unpinned is an
     op-wide canary; the narrowing cells it would cover are pinned by rows of their own.
     """
-    fields = _row_fields(body)
+    fields = row.pinned
     if "in" not in fields or "out" not in fields or fields.get("dest") == "No":
         return False
     return _mantissa_bits(DataFormat[fields["out"]]) < _mantissa_bits(
@@ -1594,10 +1568,10 @@ def test_a_sampled_zero_on_an_inexact_op_is_floored_to_one():
         *EXACT_SELECTIONS,
     }
     unfloored = [
-        f"{op}: {body}"
-        for op, body in _sampled_zero_budgets()
-        if MathOperation[op] not in EXACT_IN_EVERY_FORMAT
-        and (MathOperation[op] not in exact or _narrows_on_a_32_bit_dest(body))
+        row.describe()
+        for row in _sampled_zero_budgets()
+        if MathOperation[row.op] not in EXACT_IN_EVERY_FORMAT
+        and (MathOperation[row.op] not in exact or _narrows_on_a_32_bit_dest(row))
     ]
     assert not unfloored, "\n".join(unfloored)
 
@@ -1610,19 +1584,22 @@ def _budgets_past_their_measurement(path=_TABLE_PATH):
     comment beside it, which is the table header's rule for raising one. A sampled row
     may sit anywhere in ``[measured, MEASUREMENT_HEADROOM * measured]``, and at 1 over
     a measured 0: a finite sample cannot assert exactness."""
-    from helpers.ulp_sweep import _is_exact, _row_fields, _verdict
+    from helpers.ulp_sweep import _is_exact, _verdict
 
     problems = []
-    for op, body, budget, measured, exhaustive in _measured_budget_rows(path):
+    for row, measured, exhaustive in _measured_budget_rows(path):
         if measured is None:
             continue  # owned by test_every_step_budget_names_the_measurement_it_came_from
-        where = f"{op}: {body} (records {measured} ULP)"
+        budget = row.max_ulp
+        where = f"{row.describe()} (records {measured} ULP)"
         if exhaustive:
             # The emitter's own call: the input format decides whether a 0 was seen on
             # every value (kept) or on a stride of Float32 (written as 1, unless the op
             # is exact by construction).
-            fields = _row_fields(body)
-            verdict = _verdict(measured, fields["out"], fields.get("in"), _is_exact(op))
+            fields = row.pinned
+            verdict = _verdict(
+                measured, fields["out"], fields.get("in"), _is_exact(row.op)
+            )
             if ("ulp", budget) != verdict:
                 problems.append(
                     f"{where}: the emitter writes {verdict[1]} for that measurement, "
@@ -1649,19 +1626,17 @@ def test_a_demotion_note_names_the_budget_the_emitter_computes():
     exactly 31405 -- survives every re-emit unless something reads it."""
     from helpers.ulp_sweep import _is_exact, _verdict
 
-    note = re.compile(r"max (\d+) ULP, budget (\d+) > ceiling (\d+)")
-    wrong, op = [], None
-    for line in _TABLE_PATH.read_text(encoding="utf-8").splitlines():
-        if line and not line[0].isspace() and not line.startswith("#"):
-            op = line.split(":")[0].strip()
-        found = note.search(line)
-        if not found:
+    wrong = []
+    for row in BudgetTable.load(_TABLE_PATH).rows:
+        p = row.provenance
+        if p is None or p.kind is not Kind.DEMOTED:
             continue
-        measured, budget, ceiling = (int(g) for g in found.groups())
-        fields = _row_fields(line)
-        expected = _verdict(measured, fields["out"], fields.get("in"), _is_exact(op))
-        if expected != ("tolerance", budget) or budget <= ceiling:
-            wrong.append(f"{op}: {line.split('#', 1)[0].strip()} -> {expected}")
+        fields = row.pinned
+        expected = _verdict(
+            p.measured, fields["out"], fields.get("in"), _is_exact(row.op)
+        )
+        if expected != ("tolerance", p.budget_needed) or p.budget_needed <= p.ceiling:
+            wrong.append(f"{row.describe()} -> {expected}")
     assert not wrong, "\n".join(wrong)
 
 
@@ -1692,7 +1667,7 @@ def test_an_emitted_row_is_held_to_the_run_on_its_key_line(tmp_path):
     path.write_text(_LABELLED_OP.format(exhaustive=12, sampled=12), encoding="utf-8")
     problems = _budgets_past_their_measurement(path)
     assert len(problems) == 1 and "the emitter writes 7" in problems[0], problems
-    assert _measured_budget_rows(path)[0][4] is True, "the emitted row read as sampled"
+    assert _measured_budget_rows(path)[0][2] is True, "the emitted row read as sampled"
 
 
 # ── A gated cell is not quietly parked ────────────────────────────────────────
@@ -1801,21 +1776,18 @@ _UNMEASURABLE_CELLS_ACKNOWLEDGED_COUNTS = {
 def _not_measurable_cells(path=_TABLE_PATH):
     """``(op, in, out, approx_or_None, dest_or_None)`` for every ``not measurable`` row
     on an output a step budget could gate."""
-    from helpers.ulp_sweep import _row_fields
-
-    cells, op = [], None
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line and not line[0].isspace() and not line.startswith("#"):
-            op = line.split(":")[0].strip()
-        if "not measurable" not in line or not line.lstrip().startswith("- "):
+    cells = []
+    for row in BudgetTable.load(path).rows:
+        p = row.provenance
+        if p is None or p.kind is not Kind.UNMEASURABLE:
             continue
-        fields = _row_fields(line)
+        fields = row.pinned
         out_fmt = DataFormat[fields["out"]]
         if not has_ulp_gate(out_fmt) or out_fmt in _ULP_PROXY_DTYPES:
             continue  # a block output is never gated from this sweep
         cells.append(
             (
-                MathOperation[op],
+                MathOperation[row.op],
                 DataFormat[fields["in"]],
                 out_fmt,
                 ApproximationMode[fields["approx"]] if "approx" in fields else None,
@@ -1831,13 +1803,14 @@ def test_a_row_parked_by_disagreeing_lanes_records_the_rest_of_its_cell():
     tens of thousands measure, and the headroom report (from #57527) has a figure to
     hold it to. A row written before the emitter kept that figure records nothing for
     them; re-emit its op."""
-    shape = re.compile(r"; max \d+ ULP over the \d+ measurable lanes")
-    bare, op = [], None
-    for line in _TABLE_PATH.read_text(encoding="utf-8").splitlines():
-        if line and not line[0].isspace() and not line.startswith("#"):
-            op = line.split(":")[0].strip()
-        if "lane(s) disagreeing" in line and not shape.search(line):
-            bare.append(f"{op}: {line.split('#', 1)[0].strip()}")
+    bare = [
+        row.describe()
+        for row in BudgetTable.load(_TABLE_PATH).rows
+        if row.provenance is not None
+        and row.provenance.kind is Kind.UNMEASURABLE
+        and row.provenance.nonfinite_lanes is not None
+        and row.provenance.lanes is None
+    ]
     assert not bare, (
         f"{len(bare)} row(s) name the lanes that park their cell but not the maximum "
         "over the rest of it; re-emit their ops:\n  " + "\n  ".join(bare)
