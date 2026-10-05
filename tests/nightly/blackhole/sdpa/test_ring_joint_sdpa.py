@@ -574,8 +574,6 @@ def open_ring_joint_sdpa_runtime(
     full_mesh: bool = False,
     num_global_semaphores: int = 3,
     fabric_config: ttnn.FabricConfig = None,
-    sp_axis: int = 1,
-    tp_axis: int = 0,
 ):
     if full_mesh:
         # The caller asks for a full-mesh gather; the op resolves whether that route closes.
@@ -586,7 +584,8 @@ def open_ring_joint_sdpa_runtime(
         fabric_config = ttnn.FabricConfig.FABRIC_1D_RING if use_ring else ttnn.FabricConfig.FABRIC_1D
         topology = Topology.Ring if use_ring else Topology.Linear
 
-    assert {sp_axis, tp_axis} == {0, 1}, f"Expected distinct 2D SP/TP axes, got SP={sp_axis}, TP={tp_axis}"
+    sp_axis = 1
+    tp_axis = 0
 
     if mesh_config.sp_size < 2:
         pytest.skip(f"Ring joint attention requires at least 2 devices in ring, got SP={mesh_config.sp_size}")
@@ -603,10 +602,7 @@ def open_ring_joint_sdpa_runtime(
             ttnn.FabricManagerMode.DEFAULT,
         )
 
-        mesh_dims = [None, None]
-        mesh_dims[sp_axis] = mesh_config.sp_size
-        mesh_dims[tp_axis] = mesh_config.tp_size
-        mesh_shape = ttnn.MeshShape(*mesh_dims)
+        mesh_shape = ttnn.MeshShape(mesh_config.tp_size, mesh_config.sp_size)
         # trace_region_size defaults to 0 (no trace region), leaving every existing caller unchanged; only
         # the trace-replay test asks for one.
         mesh_device_kwargs = {"mesh_shape": mesh_shape, "trace_region_size": trace_region_size}
@@ -7145,7 +7141,7 @@ def test_ring_joint_attention_gemma4_chunked_perf_impl(perf_config, reuse_kv_buf
     )
     n_chunks = model.total_seq // perf_config.chunk_size
     use_compact_q = get_chunked_only_chunk_id(n_chunks) is not None
-    runtime = open_ring_joint_sdpa_runtime(MESH_CONFIG, topology=model.topology, sp_axis=0, tp_axis=1)
+    runtime = open_ring_joint_sdpa_runtime(MESH_CONFIG, topology=model.topology)
     try:
         run_ring_joint_sdpa_chunked(
             MESH_CONFIG,
@@ -7868,7 +7864,7 @@ def test_ring_joint_attention_gemma4_chunked_perf_check(perf_config, expected_ut
     perf_chunk = model.total_seq // chunk_size - 1
     config_id = get_gemma4_chunked_perf_config_id(perf_config)
 
-    runtime = open_ring_joint_sdpa_runtime(MESH_CONFIG, topology=model.topology, sp_axis=0, tp_axis=1)
+    runtime = open_ring_joint_sdpa_runtime(MESH_CONFIG, topology=model.topology)
     try:
         with mock.patch.dict(os.environ, {CHUNKED_PREFILL_CHUNK_ID_ENV: str(perf_chunk)}):
             duration_ns, perf_records = profile_ring_joint_runtime_duration_ns(
