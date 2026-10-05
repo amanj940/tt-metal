@@ -25,12 +25,12 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple
 
 if __package__:
-    from .ulp_provenance import BudgetTable, KeyLine, Kind, Provenance
+    from .ulp_provenance import BudgetTable, Provenance
 else:  # run by path on the slim runner, where `helpers/__init__.py` cannot import
-    from ulp_provenance import BudgetTable, KeyLine, Kind, Provenance
+    from ulp_provenance import BudgetTable, Provenance
 
 #: The key dimensions of a row, in the order a cell is named in a report.
 KEY_FIELDS = ("in", "out", "approx", "dest", "arch")
@@ -61,9 +61,9 @@ class Row:
     op: str
     key: Tuple[Tuple[str, str], ...]
     max_ulp: Optional[int]
-    #: The row's own provenance, or its op's key line when it has no comment: the table
-    #: states the run once there, and updating either registers as a re-measurement.
-    provenance: Union[Provenance, KeyLine]
+    #: The measurement the row records, from its own fields. A raise that comes with a
+    #: new one is a re-measurement; one that leaves it as it was is a number edited.
+    provenance: Provenance
     #: The near-zero floor is part of the gate: `ulp_elementwise_valid` accepts a lane
     #: inside it however many steps out it is, so widening it loosens the gate.
     near_zero_atol: Optional[float] = None
@@ -105,9 +105,9 @@ class Change:
 
     @property
     def remeasured(self) -> bool:
-        """Whether the row's provenance comment changed in the same diff -- the table's
-        rule for raising a budget. A raise with the comment untouched is a number edited
-        to make a failure go away."""
+        """Whether the row's measurement (``measured``, its date, ...) changed in the
+        same diff -- the table's rule for raising a budget. A raise with the measurement
+        untouched is a number edited to make a failure go away."""
         if self.before is None or self.after is None:
             return False
         return self.before.provenance != self.after.provenance
@@ -147,7 +147,7 @@ def parse_table(text: str) -> Dict[Cell, Row]:
             op=row.op,
             key=row.key,
             max_ulp=row.max_ulp,
-            provenance=row.provenance or table.blocks[row.op].key_line,
+            provenance=row.provenance,
             near_zero_atol=row.near_zero_atol,
         )
     return rows
@@ -305,9 +305,9 @@ def render_budget_diff(changes: List[Change], label_hint: str) -> str:
     if regressions:
         out += [
             f"**{len(regressions)} cell(s) loosen a gate.** A budget may only be raised "
-            "by re-measuring and updating that row's provenance comment in the same "
-            "change — that is the table's own rule, and it is what makes every number "
-            "in it traceable.",
+            "by re-measuring and updating that row's `measured` figure and its date in "
+            "the same change — that is the table's own rule, and it is what makes "
+            "every number in it traceable.",
             "",
             "| cell | change | before | after | re-measured |",
             "| --- | --- | --- | --- | --- |",
@@ -343,7 +343,7 @@ def _allowed_note(regressions: List[Change], label_hint: str) -> str:
     if unmeasured:
         note += (
             f"\n**{len(unmeasured)} of them carry no fresh measurement** -- the row's "
-            "provenance comment is unchanged, so the budget was edited rather than "
+            "measurement is unchanged, so the budget was edited rather than "
             "re-measured:\n\n"
         )
         note += "".join(
@@ -385,10 +385,7 @@ def _nonfinite_cells(rows: Iterable[dict]) -> Dict[Cell, int]:
 def recorded_nonfinite(row: Row) -> int:
     """How many non-finite lanes the row already accounts for: the count on a "not
     measurable" row, 0 on any other."""
-    p = row.provenance
-    if isinstance(p, Provenance) and p.kind is Kind.UNMEASURABLE:
-        return p.nonfinite_lanes or 0
-    return 0
+    return row.provenance.nonfinite or 0
 
 
 def recorded_max(row: Row) -> Optional[int]:
@@ -402,10 +399,7 @@ def recorded_max(row: Row) -> Optional[int]:
     pinned = dict(row.key)
     if "in" not in pinned or "out" not in pinned:
         return None
-    p = row.provenance
-    if isinstance(p, KeyLine):
-        p = p.header_provenance
-    return p.recorded_max
+    return row.provenance.measured
 
 
 def _headroom_line(cell: Cell, worst: int, reference: int, verdict: str) -> str:

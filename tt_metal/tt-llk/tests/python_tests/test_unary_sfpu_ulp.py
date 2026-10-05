@@ -277,9 +277,10 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
     # An emit run records the reason as the cell's verdict, so the op's grid stays
     # whole; a tolerance cell skips, having no budget to hold.
     if lanes == 0:
-        reason = "no lane a step count can describe"
-        unmeasurable = reason
+        verdict = ulp_sweep.Unmeasurable(why="no lane a step count can describe")
+        unmeasurable = verdict.why
     elif overflowed.any():
+        verdict = ulp_sweep.nonfinite_verdict(overflowed, src, golden, result, stats)
         reason = nonfinite_reason(overflowed, src, golden, result, stats, lanes)
         unmeasurable = (
             f"{reason}. No budget buys an overflow, and a step count cannot describe "
@@ -289,7 +290,7 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
         unmeasurable = None
     if unmeasurable:
         if ulp_sweep.EMIT:
-            ulp_sweep.record_unmeasurable(mathop.name, key, reason)
+            ulp_sweep.record_unmeasurable(mathop.name, key, verdict)
             return
         if not gated:
             # Skipped, but on the record: the row names how many lanes went non-finite,

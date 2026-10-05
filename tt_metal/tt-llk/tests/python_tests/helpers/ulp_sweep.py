@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from datetime import date
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -27,13 +28,10 @@ import torch
 from helpers.format_config import DataFormat
 from helpers.stimuli_generator import StimuliSpec
 from helpers.ulp_provenance import (
-    EMITTER_KINDS,
+    PROVENANCE_FIELDS,
     BudgetTable,
-    KeyLine,
-    Kind,
     Provenance,
     Row,
-    RunIdentity,
     render_row,
 )
 
@@ -765,6 +763,45 @@ def nonfinite_failures(
 NAMED_LANES = 4
 
 
+@dataclass(frozen=True)
+class Unmeasurable:
+    """A cell the sweep could not describe with a step count, as the emitter writes it:
+    a tolerance row with these figures and *why* in its comment.
+
+    *nonfinite* is how many lanes disagreed with the golden about being finite -- what
+    makes the cell unmeasurable, and the count the headroom report (from #57527) fails a
+    run on when it grows; 0 when no lane could be ranked at all. *measured* is the worst
+    lane over the lanes that *could* be ranked -- usually tens of thousands of them,
+    which a demotion used to throw away, so a cell parked by a handful of lanes recorded
+    no step count for the rest of it."""
+
+    why: str
+    nonfinite: int = 0
+    measured: Optional[int] = None
+
+
+def nonfinite_verdict(
+    overflowed: torch.Tensor,
+    src: torch.Tensor,
+    golden: torch.Tensor,
+    result: torch.Tensor,
+    stats: Dict,
+    named_lanes: int = NAMED_LANES,
+) -> Unmeasurable:
+    """The verdict a cell with non-finite disagreements is written with. *named_lanes*
+    bounds how many offending inputs are spelled out."""
+    named = "; ".join(
+        f"x={float(src[i]):g}: {float(golden[i]):g} -> {float(result[i]):g}"
+        for i in overflowed.nonzero().flatten()[:named_lanes].tolist()
+    )
+    return Unmeasurable(
+        why="lanes disagreeing with the golden about being finite "
+        f"(golden -> result: {named})",
+        nonfinite=int(overflowed.sum()),
+        measured=int(stats["max"]),
+    )
+
+
 def nonfinite_reason(
     overflowed: torch.Tensor,
     src: torch.Tensor,
@@ -774,23 +811,10 @@ def nonfinite_reason(
     lanes: int,
     named_lanes: int = NAMED_LANES,
 ) -> str:
-    """The verdict a cell with non-finite disagreements is written with.
-
-    Two numbers, because two readers want them. The lane count is what makes the cell
-    unmeasurable, and the headroom report (from #57527) fails a run in which it grows.
-    The maximum over the *measurable* lanes -- the rest of the cell, usually tens of
-    thousands of them -- is what the demotion used to throw away: a cell parked by a
-    handful of lanes recorded no step count for the rest of it. It is written as
-    ``max N ULP``, the same shape a measured row's figure has, so the same reader finds
-    it. *named_lanes* bounds how many offending inputs are spelled out.
-    """
-    named = "; ".join(
-        f"x={float(src[i]):g}: {float(golden[i]):g} -> {float(result[i]):g}"
-        for i in overflowed.nonzero().flatten()[:named_lanes].tolist()
-    )
+    """:func:`nonfinite_verdict` as one sentence, for a failure message."""
+    verdict = nonfinite_verdict(overflowed, src, golden, result, stats, named_lanes)
     return (
-        f"{int(overflowed.sum())} lane(s) disagreeing with the golden about being "
-        f"finite (golden -> result: {named}); max {int(stats['max'])} ULP over the "
+        f"{verdict.nonfinite} {verdict.why}; max {verdict.measured} ULP over the "
         f"{lanes} measurable lanes"
     )
 
@@ -811,9 +835,11 @@ WORKEROUTPUT_KEY = "ulp_measured"
 KEY_AXES = ("in", "out", "approx", "dest")
 
 #: {op_name: {(in, out, approx, dest): max_ulp}}, filled during an emitting session. A
-#: value is the worst lane's step count, a :class:`Floored` measurement, or the reason
-#: a cell could not be measured.
-MEASURED: Dict[str, Dict[Tuple[str, str, str, str], Union[int, str, "Floored"]]] = {}
+#: value is the worst lane's step count, a :class:`Floored` measurement, or an
+#: :class:`Unmeasurable` verdict.
+MEASURED: Dict[
+    str, Dict[Tuple[str, str, str, str], Union[int, "Floored", Unmeasurable]]
+] = {}
 
 #: Headroom over the measured worst lane. The sweep is exhaustive, so unlike a sampled
 #: measurement there is no unseen tail to leave room for -- but a budget at exactly the
@@ -934,27 +960,33 @@ def record(
     """
     cells = MEASURED.setdefault(op_name, {})
     current = cells.get(key)
-    if isinstance(current, str):
+    if isinstance(current, Unmeasurable):
         return  # already unmeasurable; a reading elsewhere does not rescue it
     new = Floored(max_ulp, *floor) if floor else max_ulp
     if current is None or _max_of(new) > _max_of(current):
         cells[key] = new
 
 
-def record_unmeasurable(op_name: str, key: Tuple[str, str, str, str], why: str) -> None:
+def record_unmeasurable(
+    op_name: str, key: Tuple[str, str, str, str], verdict: Unmeasurable
+) -> None:
     """Record that the cell *key* names could not be measured, and why.
 
     Written into the table as a tolerance row naming the reason, rather than left out:
     a hole in an op's grid would let ``write_table`` drop the cell's old row with
     nothing to replace it, and ``_collapse`` could stretch a neighbour's budget over it.
     """
-    MEASURED.setdefault(op_name, {})[key] = why
+    MEASURED.setdefault(op_name, {})[key] = verdict
 
 
 def export_measured() -> List[list]:
     """``MEASURED`` as plain lists, for an xdist worker to hand to the controller."""
     return [
-        [op, list(key), asdict(value) if isinstance(value, Floored) else value]
+        [
+            op,
+            list(key),
+            asdict(value) if isinstance(value, (Floored, Unmeasurable)) else value,
+        ]
         for op, cells in MEASURED.items()
         for key, value in cells.items()
     ]
@@ -963,8 +995,8 @@ def export_measured() -> List[list]:
 def merge_measured(rows) -> None:
     """Fold a worker's :func:`export_measured` into this process, worst lane winning."""
     for op, key, value in rows:
-        if isinstance(value, str):
-            record_unmeasurable(op, tuple(key), value)
+        if isinstance(value, dict) and "why" in value:
+            record_unmeasurable(op, tuple(key), Unmeasurable(**value))
         elif isinstance(value, dict):
             record(op, tuple(key), value["max_ulp"], (value["residual"], value["atol"]))
         else:
@@ -990,23 +1022,6 @@ def _incomplete_grids() -> List[Tuple[str, str, str, int]]:
             if missing:
                 gaps.append((op, pair[0], pair[1], len(missing)))
     return gaps
-
-
-def sweep_run(arch) -> RunIdentity:
-    """This session's run identity, as the key lines it writes name it. Float32 has
-    2^32 values and one run holds 2^16, so its input is strided, and calling it
-    exhaustive would overstate every row keyed on it."""
-    from datetime import date
-
-    walked = "/".join(f.name for f in SWEEP_INPUT_FORMATS if is_exhaustive(f))
-    strided = "/".join(f.name for f in SWEEP_INPUT_FORMATS if not is_exhaustive(f))
-    return RunIdentity(
-        sweep=f"exhaustive {walked}"
-        + (f" + strided {strided}" if strided else "")
-        + " sweep",
-        arch=arch.value,
-        date=date.today().isoformat(),
-    )
 
 
 def finish_emit(arch, testsfailed: int, path=None, exitstatus=0) -> WriteReport:
@@ -1041,7 +1056,8 @@ def finish_emit(arch, testsfailed: int, path=None, exitstatus=0) -> WriteReport:
     gaps = _incomplete_grids()
     if gaps:
         raise IncompleteGrid(gaps)
-    return write_table(path or _TABLE_PATH, sweep_run(arch))
+    # The day the rows name: the sweep is the run, on the arch the check above pinned.
+    return write_table(path or _TABLE_PATH, date.today())
 
 
 def _verdict(
@@ -1105,11 +1121,11 @@ def _verdict(
 
 
 def _decide(
-    cells: Dict[Tuple[str, str, str, str], Union[int, str]],
+    cells: Dict[Tuple[str, str, str, str], Union[int, "Floored", Unmeasurable]],
     exact: bool = False,
 ) -> Dict[Tuple, Tuple]:
     """Each measured cell as ``(verdict, measured, extra)``, verdict decided per output
-    format; an unmeasurable cell as ``(("unmeasurable", why), None, None)``.
+    format; an unmeasurable cell as ``(("unmeasurable", verdict), measured, None)``.
 
     A :class:`Floored` cell whose worst lane demotes it is judged on the lanes outside
     its floor: enrolled at the residual's budget with ``extra = ("floor", atol,
@@ -1117,8 +1133,8 @@ def _decide(
     was tried in ``extra = ("floor_short", atol, residual)`` so the note can say so."""
     decided = {}
     for key, v in cells.items():
-        if isinstance(v, str):
-            decided[key] = (("unmeasurable", v), None, None)
+        if isinstance(v, Unmeasurable):
+            decided[key] = (("unmeasurable", v), v.measured, None)
         elif isinstance(v, Floored):
             plain = _verdict(v.max_ulp, key[1], key[0], exact)
             floored = _verdict(v.residual, key[1], key[0], exact)
@@ -1191,13 +1207,11 @@ class WriteReport:
     #: op -> the rows its block now has.
     written: Dict[str, List[Row]]
     #: op -> why its block was kept verbatim: the field a covered row carries that
-    #: ``_render`` cannot put back (``atol``, ``near_zero_atol`` before P10, ...), or
-    #: ``alias`` for a row whose fields live on an anchor.
+    #: ``_render`` cannot put back (``atol``, ``rtol``), or ``alias`` for a row whose
+    #: fields live on an anchor.
     kept: Dict[str, str]
     #: Ops measured with no key line to write into.
     unplaced: List[str]
-    #: Rows this run did not supersede that were given the run identity they had.
-    stamped: List[Row]
 
     def summary(self) -> str:
         message = (
@@ -1300,98 +1314,51 @@ class UnplacedMeasurements(EmitRefused):
 
 #: What `_render` can put back. A row carrying anything else -- an `atol`/`rtol` pair --
 #: cannot be regenerated from a measurement, so it is preserved rather than replaced
-#: even when this sweep covers its cell.
+#: even when this sweep covers its cell. The provenance fields are always the emitter's.
 _RENDERABLE_FIELDS = frozenset(
     {"in", "out", "approx", "dest", "max_ulp", "metric", "near_zero_atol"}
+    | set(PROVENANCE_FIELDS)
 )
 
 
-def _provenance_of(row: dict) -> Provenance:
-    """The note :func:`_render` writes beside a decided row. The first figure is the one
-    the budget was derived from, which is what the audits and the headroom report read.
-    """
-    from helpers.sfpu_accuracy_budget import usable_budget_ceiling
-
+def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
+    """One decided row's fields, and the comment it carries: only what no field holds
+    -- a not-measurable cell's lanes, the floor a demotion tried. The figure the budget
+    was derived from is ``measured``; what a demotion's budget would have needed is
+    ``_verdict``'s for that figure, so it is not written down to go stale."""
     metric, value = row["verdict"]
     extra = row.get("extra")
-    if metric == "unmeasurable":
-        return Provenance.parse(f"not measurable: {value}")
-    if metric == "tolerance":
-        # Just the two numbers: the reason is in the table header, and this pair keeps
-        # the claim checkable against `usable_budget_ceiling`.
-        floor = {}
-        if extra and extra[0] == "floor_short":
-            floor = dict(floor=extra[1], residual=extra[2])
-        return Provenance(
-            Kind.DEMOTED,
-            measured=row["measured"],
-            budget_needed=value,
-            ceiling=round(usable_budget_ceiling(DataFormat[row["out"]])),
-            **floor,
-        )
-    if metric == "block":
-        return Provenance(Kind.BLOCK, measured=row["measured"])
-    if extra and extra[0] == "floor":
-        return Provenance(
-            Kind.FLOORED,
-            measured=row["measured"],
-            floor=extra[1],
-            measured_all=extra[2],
-        )
-    return Provenance(Kind.EMITTED, measured=row["measured"])
-
-
-def _render(
-    op: str, key_line: KeyLine, rows: List[dict], run: RunIdentity
-) -> List[str]:
-    """One op's block: the key line credited to *run*, and each row with its verdict
-    and the measurement behind it.
-
-    The key line keeps whatever header it already had: `Fill:  # 0 ULP, 115 variants`
-    is the provenance for every row this sweep does not reach."""
-    out = [f"{op}:  # {key_line.with_run(run).render()}\n"]
-    for row in rows:
-        metric, value = row["verdict"]
-        fields = {k: row[k] for k in KEY_AXES if k in row}
-        if metric == "ulp":
-            fields["max_ulp"] = value
-        else:
-            fields["metric"] = "tolerance"
-        extra = row.get("extra")
-        if metric == "ulp" and extra and extra[0] == "floor":
+    floored = metric == "ulp" and extra is not None and extra[0] == "floor"
+    fields: Dict[str, object] = {k: row[k] for k in KEY_AXES if k in row}
+    if metric == "ulp":
+        fields["max_ulp"] = value
+        if floored:
             fields["near_zero_atol"] = f"{extra[1]:.2e}"
-        out.append(render_row(fields, _provenance_of(row)))
+    else:
+        fields["metric"] = "tolerance"
+    provenance = Provenance(
+        measured=row["measured"],
+        measured_all=extra[2] if floored else None,
+        nonfinite=(value.nonfinite or None) if metric == "unmeasurable" else None,
+        run=run,
+    )
+    fields.update(provenance.as_fields())
+    comment = ""
+    if metric == "unmeasurable":
+        comment = f"not measurable: {value.why}"
+    elif metric == "tolerance" and extra and extra[0] == "floor_short":
+        comment = f"{extra[2]} ULP outside a {extra[1]:.2e} near-zero floor"
+    return fields, comment
+
+
+def _render(op: str, header: str, rows: List[dict], run: date) -> List[str]:
+    """One op's block: its key line as it was, and each row with its verdict and the
+    measurement behind it, credited to *run*. The key line's header -- `Fill:  # 0 ULP,
+    115 variants` -- is a person's prose and is kept."""
+    out = [f"{op}:" + (f"  # {header}" if header else "") + "\n"]
+    for row in rows:
+        out.append(render_row(*_written_row(row, run)))
     return out
-
-
-def _stamp(row: Row, key_line: KeyLine) -> Optional[Provenance]:
-    """The provenance *row* needs once its key line names this run instead of the one
-    it had, or ``None`` if it needs none.
-
-    ``_render`` replaces the key line's run, and a row this run did not supersede would
-    then be credited to it -- a pair-narrowed re-emit, or a sampled ``{out: Float32,
-    max_ulp: 0}`` under an exhaustive run the sweep cannot produce. So the run goes onto
-    those rows first: an emitter-written note naming no run (``max 1 ULP``, from an
-    earlier emit) gets the outgoing run, or the key line's header when it had none, and a
-    bare row -- hand-authored, never emitted -- the header, which is the provenance it
-    was written against.
-
-    Left alone: a row naming its own run, a hand-written note (``see the Bfp8_b note
-    above``, a sample's figures) since no run on the key line measured it and crediting
-    one would be a guess, and an ``arch:`` row, which a run on this arch never measures.
-    """
-    if not row.alias and "arch" in row.pinned:
-        return None
-    outgoing, header = key_line.run, key_line.header
-    p = row.provenance
-    if p is None:
-        origin = header or (outgoing.render() if outgoing else "")
-        return Provenance.parse(origin) if origin else None
-    if p.kind not in EMITTER_KINDS or p.names_its_run:
-        return None
-    if outgoing is not None:
-        return p.with_run(outgoing)
-    return Provenance.parse(f"{p.render()}, {header}") if header else None
 
 
 def _pins_a_measured_cell(row: Row, measured: Set[Tuple[str, str, str, str]]) -> bool:
@@ -1470,23 +1437,19 @@ def _block_end(lines: List[str], start: int) -> int:
     return end
 
 
-def _restamped(table: BudgetTable, row: Row, provenance: Provenance) -> List[str]:
-    """*row*'s lines with its comment replaced by *provenance*."""
-    lines = table.lines[row.first_line : row.last_line + 1]
-    body = lines[-1][: row.end_column].rstrip()
-    return lines[:-1] + [f"{body}  # {provenance.render()}\n"]
+def write_table(path, run: date) -> WriteReport:
+    """Replace every swept op's block in the YAML with what the sweep measured, each
+    row credited to the sweep of the day *run*.
 
-
-def write_table(path, run: RunIdentity) -> WriteReport:
-    """Replace every swept op's block in the YAML with what the sweep measured, credited
-    to *run*.
-
-    Line-oriented on purpose. The table's comments carry its provenance, and a load and
-    re-dump through PyYAML would drop every one of them, including for the ops this
+    Line-oriented on purpose. The table's comments are prose for people, and a load
+    and re-dump through PyYAML would drop every one of them, including for the ops this
     sweep never touched. Which lines are an op's key line and rows is read from
     :class:`BudgetTable`, never from the shape of a line: matching key lines by a
     trailing colon once skipped 17 ops whose key line carries a header comment, and left
     their sampled rows in place looking measured.
+
+    A row this run does not supersede keeps its own ``run`` or ``sampled`` date, so a
+    narrower re-emit never credits it to the wrong run.
 
     Raises :class:`UnplacedMeasurements` if an op in ``MEASURED`` has no key line to
     write into -- *after* writing every op that has one, so one unenrolled op does not
@@ -1501,7 +1464,6 @@ def write_table(path, run: RunIdentity) -> WriteReport:
     out: List[str] = []
     written: List[str] = []
     kept_verbatim: Dict[str, str] = {}
-    stamped_at: List[int] = []
     i = 0
     while i < len(lines):
         block = starts.get(i)
@@ -1537,23 +1499,17 @@ def write_table(path, run: RunIdentity) -> WriteReport:
         out.extend(
             _render(
                 name,
-                block.key_line,
+                block.header,
                 _collapse(_decide(cells, _is_exact(name))),
                 run,
             )
         )
         # Rows this run did not supersede -- a format it does not reach, an arch-keyed
-        # entry -- are the measurement of a different run and stay as they are.
-        # Replacing a whole op block deleted them.
+        # entry -- are the measurement of a different run and stay as they are, naming
+        # it. Replacing a whole op block deleted them.
         for row in block.rows:
-            if _replaceable(row, emitted_cells):
-                continue
-            stamp = _stamp(row, block.key_line)
-            if stamp is None:
+            if not _replaceable(row, emitted_cells):
                 out.extend(lines[row.first_line : row.last_line + 1])
-            else:
-                stamped_at.append(len(out) + row.last_line - row.first_line)
-                out.extend(_restamped(table, row, stamp))
         written.append(name)
         i = end
     # Exactly one trailing newline: an op block carries its own trailing blank lines,
@@ -1566,7 +1522,6 @@ def write_table(path, run: RunIdentity) -> WriteReport:
         written={op: after.rows_of(op) for op in written},
         kept=kept_verbatim,
         unplaced=sorted(set(MEASURED) - set(written) - set(kept_verbatim)),
-        stamped=[row for row in after.rows if row.last_line in set(stamped_at)],
     )
     if report.unplaced:
         raise UnplacedMeasurements(report)
