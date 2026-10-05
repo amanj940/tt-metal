@@ -36,9 +36,19 @@ void PowIntDeviceOperation::validate_on_program_cache_miss(
         CMAKE_UNIQUE_NAMESPACE::is_supported_dtype(input.dtype()),
         "pow_int: input dtype must be INT32, UINT32 or UINT16, got {}",
         input.dtype());
+    TT_FATAL(
+        input.device()->arch() != tt::ARCH::QUASAR || input.dtype() == DataType::INT32,
+        "pow_int: Quasar supports only INT32 input, got {}",
+        input.dtype());
 
     if (tensor_args.preallocated_output.has_value()) {
         const auto& output = *tensor_args.preallocated_output;
+        TT_FATAL(
+            output.storage_type() == StorageType::DEVICE,
+            "pow_int: output must be on device, got storage type {}",
+            output.storage_type());
+        TT_FATAL(output.buffer() != nullptr, "pow_int: output must be allocated in a device buffer");
+        TT_FATAL(output.device() == input.device(), "pow_int: output must be on the same device as input");
         TT_FATAL(
             output.dtype() == input.dtype(),
             "pow_int: output dtype {} must match input dtype {}",

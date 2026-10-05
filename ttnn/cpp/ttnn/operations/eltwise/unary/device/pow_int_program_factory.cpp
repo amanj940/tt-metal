@@ -65,7 +65,7 @@ ProgramArtifacts PowIntDeviceOperation::ProgramFactory::create_program_artifacts
             .dfb_spec_name = IN_DFB, .accessor_name = "in", .endpoint_type = m2::DFBEndpointType::PRODUCER}},
         .tensor_bindings = {m2::TensorBinding{.tensor_parameter_name = INPUT, .accessor_name = "src"}},
         .runtime_arg_schema = {.runtime_arg_names = {"num_pages", "start_id"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     const m2::KernelSpec writer{
@@ -77,7 +77,7 @@ ProgramArtifacts PowIntDeviceOperation::ProgramFactory::create_program_artifacts
             .dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = m2::DFBEndpointType::CONSUMER}},
         .tensor_bindings = {m2::TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "dst"}},
         .runtime_arg_schema = {.runtime_arg_names = {"num_pages", "start_id"}},
-        .hw_config = ttnn::create_writer_datamovement_config(),
+        .hw_config = ttnn::create_writer_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     // 32-bit integers are exact only in a 32-bit Dest, unpacked straight to Dest (SrcA would truncate).

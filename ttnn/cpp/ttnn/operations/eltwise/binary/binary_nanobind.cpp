@@ -2073,6 +2073,7 @@ void bind_power(nb::module_& mod, const std::string& note = "") {
 
             If the input tensor is ROW_MAJOR layout, it will be internally converted to TILE layout.
             Integer results wrap modulo 2^32 (2^16 for UINT16) on overflow.
+            On Quasar, INT32 is the only supported integer dtype.
 
             {2}
         )doc",

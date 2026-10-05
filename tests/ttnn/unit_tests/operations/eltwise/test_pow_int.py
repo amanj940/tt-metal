@@ -45,6 +45,11 @@ def random_full_range_input(shape, ttnn_dtype) -> torch.Tensor:
     return torch.randint(MIN_TEST_VALUE[ttnn_dtype], MAX_TEST_VALUE[ttnn_dtype], shape, dtype=torch.int32)
 
 
+def skip_unsupported_quasar_dtype(ttnn_dtype, device):
+    if device.arch() == ttnn.device.Arch.QUASAR and ttnn_dtype != ttnn.int32:
+        pytest.skip("Quasar supports only INT32 integer pow")
+
+
 def torch_pow(torch_input: torch.Tensor, exponent) -> torch.Tensor:
     """Reference for inputs whose result fits the dtype."""
     return torch.pow(torch_input.to(torch.int64), int(exponent)).to(torch.int32)
@@ -58,6 +63,7 @@ def run_pow(
     memory_config=ttnn.DRAM_MEMORY_CONFIG,
     output_memory_config=None,
 ) -> torch.Tensor:
+    skip_unsupported_quasar_dtype(ttnn_dtype, device)
     tt_input = ttnn.from_torch(
         torch_input, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device, memory_config=memory_config
     )
@@ -201,6 +207,19 @@ def test_pow_int_known_values(ttnn_dtype, exponent, values, expected_values, dev
     assert_equal(actual, expected)
 
 
+def test_pow_uint32_high_bit_values(device):
+    skip_unsupported_quasar_dtype(ttnn.uint32, device)
+    torch_input = torch.zeros((32, 32), dtype=torch.uint32)
+    torch_input[0, :4] = torch.tensor([0x80000000, 0x80000001, 0xFFFFFFFE, 0xFFFFFFFF], dtype=torch.uint32)
+
+    tt_input = ttnn.from_torch(torch_input, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+    actual = ttnn.to_torch(ttnn.pow(tt_input, 2), dtype=torch.uint32)
+
+    expected = torch.zeros_like(torch_input)
+    expected[0, :4] = torch.tensor([0, 1, 4, 1], dtype=torch.uint32)
+    assert torch.equal(actual, expected), f"expected {expected[0, :4].tolist()}, got {actual[0, :4].tolist()}"
+
+
 @pytest.mark.parametrize("ttnn_dtype", ALL_DTYPES, ids=dtype_id)
 @pytest.mark.parametrize("make_input_config, output_config", MEMORY_CONFIG_CASES)
 def test_pow_int_memory_configs(make_input_config, output_config, ttnn_dtype, device):
@@ -221,6 +240,7 @@ def test_pow_int_memory_configs(make_input_config, output_config, ttnn_dtype, de
 
 @pytest.mark.parametrize("ttnn_dtype", ALL_DTYPES, ids=dtype_id)
 def test_pow_int_preallocated_output(ttnn_dtype, device):
+    skip_unsupported_quasar_dtype(ttnn_dtype, device)
     torch_input = random_input_without_overflow(DEFAULT_SHAPE, HOST_PATH_EXPONENT, ttnn_dtype)
     tt_input = ttnn.from_torch(torch_input, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
     tt_output = ttnn.from_torch(
@@ -249,6 +269,18 @@ def test_pow_int_negative_exponent_raises(ttnn_dtype, device, expect_error):
 
     with expect_error(RuntimeError, "negative integer powers"):
         ttnn.pow(tt_input, -1)
+
+
+@pytest.mark.parametrize("ttnn_dtype", [ttnn.uint32, ttnn.uint16], ids=dtype_id)
+def test_pow_int_rejects_unsigned_input_on_quasar(ttnn_dtype, device, expect_error):
+    if device.arch() != ttnn.device.Arch.QUASAR:
+        pytest.skip("Quasar-specific validation")
+
+    torch_input = torch.ones((32, 32), dtype=torch.int32)
+    tt_input = ttnn.from_torch(torch_input, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+
+    with expect_error(RuntimeError, "Quasar supports only INT32 input"):
+        ttnn.pow(tt_input, 2)
 
 
 @pytest.mark.parametrize("max_value", [INT32_MAX, UINT16_MAX])
