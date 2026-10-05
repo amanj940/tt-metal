@@ -78,6 +78,7 @@ enum class BinaryOp : std::uint8_t
     DEQUANT,
     ATAN2,
     COPY_DEST,
+    GCD,
 };
 
 // For instructions that address lower/upper 16 bits of a register
