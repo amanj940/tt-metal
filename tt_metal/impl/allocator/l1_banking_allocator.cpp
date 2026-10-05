@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "bank_manager.hpp"
+#include "internal/tt-2xx/quasar/noc/att/configs/quasar_aether_2x3_att_config.h"
 #include "hal_types.hpp"
 #include "impl/context/metal_context.hpp"
 #include "impl/allocator/allocator_types.hpp"
@@ -223,14 +224,17 @@ AllocatorConfig L1BankingAllocator::generate_config(
     // Tensix/Eth <-> Tensix/Eth src and dst addrs must be L1_ALIGNMENT aligned
     const auto& logical_size = soc_desc.get_grid_size(CoreType::TENSIX);
     const auto& compute_size = tt::get_compute_grid_size(env, device_id, num_hw_cqs, dispatch_core_config);
-    // The quasar_aether_2x3 map's DRAM endpoints are addressable within a 64 MiB
-    // local field while the DRAM view is larger. Clamp the bank size so top-down
+    // Under the quasar_aether_2x3 map a DRAM bank is addressable only within its
+    // window's local-address field. Bound the bank size by it so top-down
     // allocations (kernel binaries) never compose an out-of-window operand.
     uint64_t att_dram_view_size = soc_desc.dram_view_size;
     if (hal.get_arch() == tt::ARCH::QUASAR) {
         const char* att_map = std::getenv("TT_METAL_NOC_ATT");
         if (att_map != nullptr && std::string_view(att_map) == "quasar_aether_2x3") {
-            constexpr uint64_t k_aether_dram_window_span = 1ull << 26;
+            constexpr uint64_t k_aether_dram_window_span =
+                noc_att::map_window(quasar_aether_2x3_att_config::MAP, noc_att::WindowClass::Dram)
+                    .local_address_limit();
+            static_assert(k_aether_dram_window_span >= (1ull << 30), "the 2x3 DRAM window must span the 1 GiB view");
             att_dram_view_size = std::min<uint64_t>(att_dram_view_size, k_aether_dram_window_span);
         }
     }

@@ -58,9 +58,9 @@ FORCE_INLINE uint64_t packed_worker_address(uint32_t packed_xy, uint32_t local_a
     // kernel-visible coordinate frame - and they carry BOTH worker (L1 bank)
     // and DRAM tile coordinates through this one entry point. A packed
     // coordinate is exactly an endpoint word, so resolve it the way
-    // resolve_current does: the worker table first, then the full-tile table
-    // (which covers the DRAM/perimeter tiles). On the aether map a DRAM tile
-    // resolves to the same remote-window selector Address::dram produces.
+    // resolve_current does: the worker table, then the DRAM table, then the
+    // full-tile table (which covers the perimeter tiles). A DRAM tile resolves
+    // to the same window and selector Address::dram produces.
     const uint32_t x = packed_xy & ((1u << NOC_ADDR_NODE_ID_BITS) - 1);
     const uint32_t y = (packed_xy >> NOC_ADDR_NODE_ID_BITS) & ((1u << NOC_ADDR_NODE_ID_BITS) - 1);
     const noc_att::ResolvedTile tile = noc_att::resolve_current(ACTIVE_ATT_MAP, x, y);

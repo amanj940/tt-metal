@@ -131,6 +131,7 @@ struct MapData {
     /// to resolve this initiator's identity from its NOC_NODE_ID coordinate.
     Table<std::uint16_t> worker_endpoint_words;
     Table<std::uint16_t> full_tile_endpoint_words;
+    Table<std::uint16_t> dram_endpoint_words;
 
     /// Logical DRAM bank -> selector. Empty = no binding: every Dram identity
     /// resolves invalid.
@@ -293,6 +294,11 @@ constexpr ResolvedTile resolve_current(const MapData& map, std::uint32_t noc_x, 
     for (std::uint32_t selector = 0; selector < map.worker_endpoint_words.size(); ++selector) {
         if (map.worker_endpoint_words[selector] == endpoint) {
             return {selector, noc_x, noc_y, true, WindowClass::Worker};
+        }
+    }
+    for (std::uint32_t selector = 0; selector < map.dram_endpoint_words.size(); ++selector) {
+        if (map.dram_endpoint_words[selector] == endpoint) {
+            return {selector, noc_x, noc_y, true, WindowClass::Dram};
         }
     }
     for (std::uint32_t selector = 0; selector < map.full_tile_endpoint_words.size(); ++selector) {

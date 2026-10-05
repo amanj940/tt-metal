@@ -173,12 +173,15 @@ TEST(QuasarAttAddressAether, LocalEncodesThroughTheTranslatingWindow) {
     static_assert(*Address::local(0).encode<AETHER>() == noc_att::local_window_base(AETHER));
 }
 
-TEST(QuasarAttAddressAether, WorkerAndDramEncodeThroughTheRemoteWindow) {
+TEST(QuasarAttAddressAether, WorkerEncodesThroughTheRemoteWindowAndDramThroughItsOwn) {
     // Worker (1,1) -> selector 1 -> 0x10_0000_0000 | 1<<26 | offset.
     static_assert(*Address::worker(1, 1, 0x1000).encode<AETHER>() == 0x1004001000ull);
     static_assert(*Address::worker(0, 1, 0).encode<AETHER>() == 0x1000000000ull);
-    // Logical DRAM bank 1 -> selector 3 (aether_utils configure_aether_dram).
-    static_assert(*Address::dram(1, 0x2000).encode<AETHER>() == (0x1000000000ull | (3ull << 26) | 0x2000));
+    // Logical DRAM bank 1 -> DRAM-window selector 1 -> 0x20_0000_0000 | 1<<30 | offset.
+    static_assert(*Address::dram(1, 0x2000).encode<AETHER>() == (0x2000000000ull | (1ull << 30) | 0x2000));
+    // The DRAM window carries the whole 1 GiB bank and nothing past it.
+    static_assert(Address::dram(0, (1ull << 30) - 32).encode<AETHER>(32).has_value());
+    static_assert(!Address::dram(0, 1ull << 30).encode<AETHER>().has_value());
     // The UMD-visible dispatch tile (0,2) -> tile selector 4 (endpoint word 0x80).
     static_assert(*Address::dispatch(0, 2, 0).encode<AETHER>() == (0x1000000000ull | (4ull << 26)));
 }
@@ -280,13 +283,18 @@ TEST(QuasarAttAddressAether, PackedDramEndpointsMatchAddressDram) {
     // emulator run). Aether DRAM tiles: bank 0 -> (0,0), bank 1 -> (1,0).
     constexpr ResolvedTile bank0 = noc_att::resolve_current(AETHER, 0, 0);
     static_assert(bank0.valid);
-    static_assert(bank0.window == WindowClass::FullTile);
+    static_assert(bank0.window == WindowClass::Dram);
+    static_assert(bank0.selector == 0);
     static_assert(
         noc_att::map_window(AETHER, bank0.window).make_address(bank0.selector, 0x2000) ==
         *Address::dram(0, 0x2000).encode<AETHER>());
+    static_assert(
+        noc_att::map_window(AETHER, bank0.window).make_address(bank0.selector, 0x3FFF0000) ==
+        *Address::dram(0, 0x3FFF0000).encode<AETHER>());
     constexpr ResolvedTile bank1 = noc_att::resolve_current(AETHER, 1, 0);
     static_assert(bank1.valid);
-    static_assert(bank1.window == WindowClass::FullTile);
+    static_assert(bank1.window == WindowClass::Dram);
+    static_assert(bank1.selector == 1);
     static_assert(
         noc_att::map_window(AETHER, bank1.window).make_address(bank1.selector, 0x2000) ==
         *Address::dram(1, 0x2000).encode<AETHER>());
